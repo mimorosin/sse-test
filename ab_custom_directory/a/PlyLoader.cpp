@@ -567,10 +567,7 @@ void PLYImporter::LoadFace(const PLY::Element *pcElement, const PLY::ElementInst
         if (mGeneratedMesh->mFaces == nullptr) {
             mGeneratedMesh->mNumFaces = pcElement->NumOccur;
             mGeneratedMesh->mFaces = new aiFace[mGeneratedMesh->mNumFaces];
-        } else {
-             if (mGeneratedMesh->mNumFaces < pcElement->NumOccur) {
-                 throw DeadlyImportError("Invalid .ply file: Too many faces");
-             }
+        }
 
         if (!bIsTriStrip) {
             // parse the list of vertex indices
