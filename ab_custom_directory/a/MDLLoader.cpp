@@ -62,8 +62,70 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/importerdesc.h>
 
 #include <memory>
+#include <cstring>
+#include <new>
 
 using namespace Assimp;
+
+// ------------------------------------------------------------------------------------------------
+// Test-only: deliberate vulnerable helpers and their patched counterparts (static analysis / diff tests)
+namespace MDLLoaderTest {
+
+// CWE-787: memcpy without validating len against dstCapacity
+void MDLLoader_TestCopyBytes_Vulnerable(void* dst, size_t dstCapacity, const void* src, size_t len) {
+    (void)dstCapacity;
+    if (!dst || !src) {
+        return;
+    }
+    std::memcpy(dst, src, len);
+}
+
+/*
+// Patched: fail if len exceeds buffer; optionally report bytes copied on success
+bool MDLLoader_TestCopyBytes_Patched(void* dst, size_t dstCapacity, const void* src, size_t len, size_t* outCopied) {
+    if (outCopied) {
+        *outCopied = 0;
+    }
+    if (!dst || !src) {
+        return false;
+    }
+    if (len > dstCapacity) {
+        return false;
+    }
+    std::memcpy(dst, src, len);
+    if (outCopied) {
+        *outCopied = len;
+    }
+    return true;
+}
+*/
+
+// CWE-190: count * elemSize may wrap; allocation may be too small for later use
+char* MDLLoader_TestAllocArray_Vulnerable(size_t count, size_t elemSize) {
+    const size_t bytes = count * elemSize;
+    return new char[bytes];
+}
+
+/*
+// Patched: reject overflow and zero-size edge cases explicitly
+char* MDLLoader_TestAllocArray_Patched(size_t count, size_t elemSize, bool* ok) {
+    if (!ok) {
+        return nullptr;
+    }
+    *ok = false;
+    if (count == 0u || elemSize == 0u) {
+        return nullptr;
+    }
+    if (count > SIZE_MAX / elemSize) {
+        return nullptr;
+    }
+    const size_t bytes = count * elemSize;
+    *ok = true;
+    return new (std::nothrow) char[bytes];
+}
+*/
+
+} // namespace MDLLoaderTest
 
 static const aiImporterDesc desc = {
     "Quake Mesh / 3D GameStudio Mesh Importer",
