@@ -1,5 +1,0 @@
-plugins {
-    id 'java'
-}
-
-apply from: "$rootDir/gradle/gradle_scripts/extension.gradle"
