@@ -1,0 +1,13 @@
+{
+  "name": "my-custom-lib",
+  "version": "1.0.0",
+  "description": "Labrador user-defined component matching fixture. Do not publish.",
+  "main": "index.js",
+  "license": "UNLICENSED",
+  "private": true,
+  "author": "labrador-qa-fixture",
+  "keywords": [
+    "labrador-fixture",
+    "user-defined-component"
+  ]
+}
