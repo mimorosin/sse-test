@@ -1,0 +1,353 @@
+package io.xpipe.app.comp.base;
+
+import io.xpipe.app.browser.BrowserFullSessionModel;
+import io.xpipe.app.comp.Comp;
+import io.xpipe.app.comp.CompStructure;
+import io.xpipe.app.comp.SimpleCompStructure;
+import io.xpipe.app.core.AppLayoutModel;
+import io.xpipe.app.hub.comp.StoreViewState;
+import io.xpipe.app.platform.DerivedObservableList;
+
+import javafx.animation.AnimationTimer;
+import javafx.application.Platform;
+import javafx.beans.binding.Bindings;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.collections.ListChangeListener;
+import javafx.collections.ObservableList;
+import javafx.css.PseudoClass;
+import javafx.scene.Node;
+import javafx.scene.control.ScrollBar;
+import javafx.scene.control.ScrollPane;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.VBox;
+
+import lombok.Setter;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+
+public class ListBoxViewComp<T> extends Comp<CompStructure<ScrollPane>> {
+
+    private static final PseudoClass ODD = PseudoClass.getPseudoClass("odd");
+    private static final PseudoClass EVEN = PseudoClass.getPseudoClass("even");
+    private static final PseudoClass FIRST = PseudoClass.getPseudoClass("first");
+    private static final PseudoClass LAST = PseudoClass.getPseudoClass("last");
+
+    private final ObservableList<T> shown;
+    private final ObservableList<T> all;
+
+    private final Function<T, Comp<?>> compFunction;
+    private final boolean scrollBar;
+
+    @Setter
+    private boolean visibilityControl = false;
+
+    public ListBoxViewComp(
+            ObservableList<T> shown, ObservableList<T> all, Function<T, Comp<?>> compFunction, boolean scrollBar) {
+        this.shown = shown;
+        this.all = all;
+        this.compFunction = compFunction;
+        this.scrollBar = scrollBar;
+    }
+
+    @Override
+    public CompStructure<ScrollPane> createBase() {
+        Map<T, Region> cache = new IdentityHashMap<>();
+
+        VBox vbox = new VBox();
+        vbox.getStyleClass().add("list-box-content");
+        vbox.setFocusTraversable(false);
+        var scroll = new ScrollPane(vbox);
+
+        refresh(scroll, vbox, shown, all, cache, false);
+
+        var hadScene = new AtomicBoolean(false);
+        scroll.sceneProperty().subscribe(scene -> {
+            if (scene != null) {
+                hadScene.set(true);
+                refresh(scroll, vbox, shown, all, cache, true);
+            }
+        });
+
+        shown.addListener((ListChangeListener<? super T>) (c) -> {
+            Platform.runLater(() -> {
+                if (scroll.getScene() == null && hadScene.get()) {
+                    return;
+                }
+
+                refresh(scroll, vbox, c.getList(), all, cache, true);
+            });
+        });
+
+        if (scrollBar) {
+            scroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.ALWAYS);
+            scroll.skinProperty().subscribe(newValue -> {
+                if (newValue != null) {
+                    ScrollBar bar = (ScrollBar) scroll.lookup(".scroll-bar:vertical");
+                    bar.opacityProperty()
+                            .bind(Bindings.createDoubleBinding(
+                                    () -> {
+                                        var v = bar.getVisibleAmount();
+                                        // Check for rounding and accuracy issues
+                                        // It might not be exactly equal to 1.0
+                                        return v < 0.99 ? 1.0 : 0.0;
+                                    },
+                                    bar.visibleAmountProperty()));
+                }
+            });
+        } else {
+            scroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+            scroll.setFitToHeight(true);
+        }
+        scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("list-box-view-comp");
+
+        registerVisibilityListeners(scroll, vbox);
+
+        return new SimpleCompStructure<>(scroll);
+    }
+
+    private void registerVisibilityListeners(ScrollPane scroll, VBox vbox) {
+        if (!visibilityControl) {
+            return;
+        }
+
+        var dirty = new SimpleBooleanProperty();
+        var animationTimer = new AnimationTimer() {
+            @Override
+            public void handle(long now) {
+                if (!dirty.get()) {
+                    return;
+                }
+
+                updateVisibilities(scroll, vbox);
+                dirty.set(false);
+            }
+        };
+
+        scroll.vvalueProperty().addListener((observable, oldValue, newValue) -> {
+            // Fix scrollbar resetting on fast scroll
+            // If one node within has focus and moves out of focus fast,
+            // the scrollbar will try to focus another one and move it into view
+            // This can result in flicker when scrolling fast enough
+            if (scroll.isFocusWithin()) {
+                scroll.requestFocus();
+            }
+            dirty.set(true);
+        });
+        scroll.heightProperty().addListener((observable, oldValue, newValue) -> {
+            dirty.set(true);
+        });
+        vbox.heightProperty().addListener((observable, oldValue, newValue) -> {
+            dirty.set(true);
+        });
+
+        // We can't directly listen to any parent element changing visibility, so this is a compromise
+        if (AppLayoutModel.get() != null) {
+            AppLayoutModel.get().getSelected().addListener((observable, oldValue, newValue) -> {
+                dirty.set(true);
+            });
+        }
+        BrowserFullSessionModel.DEFAULT.getSelectedEntry().addListener((observable, oldValue, newValue) -> {
+            dirty.set(true);
+        });
+        if (StoreViewState.get() != null) {
+            StoreViewState.get().getEffectiveSortMode().addListener((observable, oldValue, newValue) -> {
+                // This is very ugly, but it just takes multiple iterations for the order to apply
+                Platform.runLater(() -> {
+                    Platform.runLater(() -> {
+                        Platform.runLater(() -> {
+                            dirty.set(true);
+                        });
+                    });
+                });
+            });
+
+            StoreViewState.get().getEntriesListUpdateObservable().addListener((observable, oldValue, newValue) -> {
+                // This is very ugly, but it just takes multiple iterations for the order to apply
+                Platform.runLater(() -> {
+                    Platform.runLater(() -> {
+                        Platform.runLater(() -> {
+                            dirty.set(true);
+                        });
+                    });
+                });
+            });
+        }
+
+        vbox.sceneProperty().addListener((observable, oldValue, newValue) -> {
+            dirty.set(true);
+
+            if (newValue != null) {
+                animationTimer.start();
+            } else {
+                animationTimer.stop();
+            }
+
+            Node c = vbox;
+            do {
+                c.boundsInParentProperty().addListener((change, oldBounds, newBounds) -> {
+                    dirty.set(true);
+                });
+                // Don't listen to root node changes, we don't need that
+            } while ((c = c.getParent()) != null && c.getParent() != null);
+
+            if (newValue != null) {
+                newValue.heightProperty().addListener((observable1, oldValue1, newValue1) -> {
+                    dirty.set(true);
+                });
+            }
+        });
+    }
+
+    private boolean isVisible(ScrollPane pane, VBox box, Node node) {
+        if (pane.getScene() == null || box.getScene() == null || node.getScene() == null) {
+            return false;
+        }
+
+        // Preload items at the edges by enlarging the height
+        var paneHeight = pane.getHeight() * 1.2;
+        var scrollCenter = box.getBoundsInLocal().getHeight() * pane.getVvalue();
+        var minBoundsHeight = scrollCenter - paneHeight;
+        var maxBoundsHeight = scrollCenter + paneHeight;
+
+        var nodeMinHeight = node.getBoundsInParent().getMinY();
+        var nodeMaxHeight = node.getBoundsInParent().getMaxY();
+
+        // There are some rounding errors when display scaling is enabled,
+        // so don't check for 0.0
+        if (paneHeight < 5.0
+                || box.getHeight() < 5.0
+                || ((Region) node).getHeight() < 5.0
+                || nodeMinHeight == nodeMaxHeight) {
+            return false;
+        }
+
+        if (nodeMaxHeight < minBoundsHeight) {
+            // Use soft buffer zone to keep items visible a bit if moved out
+            // This prevents jittering when display scaling causes rounding errors around the edges
+            var useBufferZone = node.isVisible() && minBoundsHeight - nodeMaxHeight < 30.0;
+            if (!useBufferZone) {
+                return false;
+            }
+        }
+
+        if (nodeMinHeight > maxBoundsHeight) {
+            // Use soft buffer zone to keep items visible a bit if moved out
+            // This prevents jittering when display scaling causes rounding errors around the edges
+            var useBufferZone = node.isVisible() && nodeMinHeight - maxBoundsHeight < 30.0;
+            if (!useBufferZone) {
+                return false;
+            }
+        }
+
+        if (pane.getScene().getHeight() > 200) {
+            var sceneNodeBounds = node.localToScene(node.getBoundsInLocal());
+            // Add some margin to preload
+            if (sceneNodeBounds.getMaxY() < -100
+                    || sceneNodeBounds.getMinY() > pane.getScene().getHeight() + 100) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void updateVisibilities(ScrollPane scroll, VBox vbox) {
+        if (!Platform.isFxApplicationThread()) {
+            throw new IllegalStateException("Not in FxApplication thread");
+        }
+
+        if (!scroll.isVisible() || !vbox.isVisible()) {
+            return;
+        }
+
+        if (!visibilityControl) {
+            return;
+        }
+
+        int count = 0;
+        for (Node child : vbox.getChildren()) {
+            var v = isVisible(scroll, vbox, child);
+            child.setVisible(v);
+            if (v) {
+                count++;
+            }
+        }
+
+        //        if (count > 10) {
+        //            System.out.println("Visible: " + count);
+        //        }
+    }
+
+    private void refresh(
+            ScrollPane scroll,
+            VBox listView,
+            List<? extends T> shown,
+            List<? extends T> all,
+            Map<T, Region> cache,
+            boolean refreshVisibilities) {
+        Runnable update = () -> {
+            if (!Platform.isFxApplicationThread()) {
+                throw new IllegalStateException("Not in FxApplication thread");
+            }
+
+            var set = new HashSet<T>();
+            // These lists might diverge on updates, so add both
+            synchronized (shown) {
+                set.addAll(shown);
+            }
+            synchronized (all) {
+                set.addAll(all);
+            }
+            // Clear cache of unused values
+            cache.keySet().retainAll(set);
+
+            // Use copy to prevent concurrent modifications and to not synchronize to long
+            List<T> shownCopy;
+            synchronized (shown) {
+                shownCopy = new ArrayList<>(shown);
+            }
+            List<Region> newShown = shownCopy.stream()
+                    .map(v -> {
+                        if (!cache.containsKey(v)) {
+                            var comp = compFunction.apply(v);
+                            if (comp != null) {
+                                var r = comp.createRegion();
+                                if (visibilityControl) {
+                                    r.setVisible(false);
+                                }
+                                cache.put(v, r);
+                            } else {
+                                cache.put(v, null);
+                            }
+                        }
+
+                        return cache.get(v);
+                    })
+                    .filter(region -> region != null)
+                    .toList();
+
+            if (listView.getChildren().equals(newShown)) {
+                return;
+            }
+
+            for (int i = 0; i < newShown.size(); i++) {
+                var r = newShown.get(i);
+                r.pseudoClassStateChanged(ODD, i % 2 != 0);
+                r.pseudoClassStateChanged(EVEN, i % 2 == 0);
+                r.pseudoClassStateChanged(FIRST, i == 0);
+                r.pseudoClassStateChanged(LAST, i == newShown.size() - 1);
+            }
+
+            var d = DerivedObservableList.wrap(listView.getChildren(), true);
+            d.setContent(newShown);
+            if (refreshVisibilities) {
+                updateVisibilities(scroll, listView);
+            }
+        };
+        update.run();
+    }
+}

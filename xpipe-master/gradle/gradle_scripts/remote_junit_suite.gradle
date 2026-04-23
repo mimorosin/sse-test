@@ -1,0 +1,44 @@
+import java.util.stream.Collectors
+
+apply from: "$rootDir/gradle/gradle_scripts/junit.gradle"
+
+testing {
+    suites {
+        remoteTest(JvmTestSuite) {
+            useJUnitJupiter()
+
+            dependencies {
+                implementation project(':core')
+                implementation project(':beacon')
+                implementation project()
+            }
+
+            targets {
+                configureEach {
+                    testTask.configure {
+                        workingDir = projectDir
+
+                        jvmArgs += ["-Xmx2g"]
+                        jvmArgs += jvmRunArgs
+
+                        def daemonArgs = Map.of(
+                                propertyName("dataDir"), "$projectDir/local/",
+                                propertyName("persistData"), "false",
+                                propertyName("writeSysOut"), "true",
+                                propertyName("writeLogs"), "false",
+                                propertyName("logLevel"), "trace",
+                                propertyName("beacon", "port"), "21723",
+                                propertyName("beacon", "printMessages"), "true"
+                        )
+                        def daemonArgsString = daemonArgs.entrySet().stream()
+                                .map(e -> e.getKey() + "=" + e.getValue())
+                                .collect(Collectors.joining(" "))
+
+                        systemProperty propertyName("beacon", "daemonArgs"), daemonArgsString
+                        systemProperty propertyName("beacon", "port"), "21723"
+                    }
+                }
+            }
+        }
+    }
+}

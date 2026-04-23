@@ -1,0 +1,267 @@
+package io.xpipe.app.browser.file;
+
+import io.xpipe.app.browser.BrowserFullSessionModel;
+import io.xpipe.app.browser.action.impl.TransferFilesActionProvider;
+import io.xpipe.app.core.AppLocalTemp;
+import io.xpipe.app.core.AppSystemInfo;
+import io.xpipe.app.core.mode.AppOperationMode;
+import io.xpipe.app.issue.ErrorEventFactory;
+import io.xpipe.app.prefs.AppPrefs;
+import io.xpipe.app.process.OsFileSystem;
+import io.xpipe.app.storage.DataStorage;
+import io.xpipe.app.util.BooleanScope;
+import io.xpipe.app.util.DesktopHelper;
+import io.xpipe.app.util.ThreadHelper;
+
+import javafx.beans.binding.Bindings;
+import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.Property;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.property.SimpleObjectProperty;
+import javafx.beans.value.ObservableBooleanValue;
+import javafx.collections.FXCollections;
+import javafx.collections.ObservableList;
+
+import lombok.Value;
+import org.apache.commons.io.FileUtils;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+@Value
+public class BrowserTransferModel {
+
+    private static final Path TEMP = AppLocalTemp.getLocalTempDataDirectory("download");
+
+    BrowserFullSessionModel browserSessionModel;
+    ObservableList<Item> items = FXCollections.observableArrayList();
+    ObservableBooleanValue empty = Bindings.createBooleanBinding(() -> items.isEmpty(), items);
+    BooleanProperty transferring = new SimpleBooleanProperty();
+
+    public BrowserTransferModel(BrowserFullSessionModel browserSessionModel) {
+        this.browserSessionModel = browserSessionModel;
+        var thread = ThreadHelper.createPlatformThread("file downloader", true, () -> {
+            while (true) {
+                Optional<Item> toDownload;
+                synchronized (items) {
+                    toDownload = items.stream()
+                            .filter(item -> !item.getDownloadFinished().get())
+                            .findFirst();
+                }
+                if (toDownload.isPresent()) {
+                    downloadSingle(toDownload.get());
+                } else {
+                    ThreadHelper.sleep(20);
+                }
+            }
+        });
+        thread.start();
+    }
+
+    public List<Item> getCurrentItems() {
+        synchronized (items) {
+            return new ArrayList<>(items);
+        }
+    }
+
+    private void cleanItem(Item item) {
+        if (!Files.isDirectory(TEMP)) {
+            return;
+        }
+
+        if (!Files.exists(item.getLocalFile())) {
+            return;
+        }
+
+        try {
+            FileUtils.forceDelete(item.getLocalFile().toFile());
+        } catch (IOException e) {
+            ErrorEventFactory.fromThrowable(e).handle();
+        }
+    }
+
+    public void clear(boolean delete) {
+        List<Item> toClear;
+        synchronized (items) {
+            toClear = items.stream()
+                    .filter(item -> item.getDownloadFinished().get())
+                    .toList();
+            if (toClear.isEmpty()) {
+                return;
+            }
+            items.removeAll(toClear);
+        }
+        if (delete) {
+            for (Item item : toClear) {
+                cleanItem(item);
+            }
+        }
+    }
+
+    public void drop(BrowserFileSystemTabModel model, List<BrowserEntry> entries) {
+        synchronized (items) {
+            entries.forEach(entry -> {
+                var resolved = entry.getRawFileEntry().resolved();
+                var name = resolved.getName();
+                if (items.stream().anyMatch(item -> item.getName().equals(name))) {
+                    return;
+                }
+
+                var fixedFile = OsFileSystem.ofLocal().makeFileSystemCompatible(resolved.getPath());
+                Path file = TEMP.resolve(fixedFile.getFileName());
+                var item = new Item(model, name, entry, file);
+                items.add(item);
+            });
+        }
+    }
+
+    public void downloadSingle(Item item) {
+        try {
+            FileUtils.forceMkdir(TEMP.toFile());
+        } catch (IOException e) {
+            ErrorEventFactory.fromThrowable(e).handle();
+            return;
+        }
+
+        if (item.getDownloadFinished().get()) {
+            return;
+        }
+
+        var itemModel = item.getOpenFileSystemModel();
+        if (itemModel == null) {
+            return;
+        }
+
+        if (AppOperationMode.isInShutdown()) {
+            return;
+        }
+
+        try (var ignored = new BooleanScope(itemModel.getBusy()).exclusive().start()) {
+            transferring.setValue(true);
+            var op = new BrowserFileTransferOperation(
+                    BrowserLocalFileSystem.getLocalFileEntry(TEMP),
+                    List.of(item.getBrowserEntry().getRawFileEntry().resolved()),
+                    BrowserFileTransferMode.COPY,
+                    false,
+                    progress -> {
+                        // Don't update item progress to keep it as finished
+                        if (progress == null) {
+                            itemModel.updateProgress(null);
+                            return;
+                        }
+
+                        synchronized (item.getProgress()) {
+                            item.getProgress().setValue(progress);
+                        }
+                        itemModel.updateProgress(progress);
+                    },
+                    itemModel.getTransferCancelled());
+            var action = TransferFilesActionProvider.Action.builder()
+                    .operation(op)
+                    .target(DataStorage.get().local().ref())
+                    .download(true)
+                    .build();
+            if (!action.executeSync()) {
+                synchronized (items) {
+                    items.remove(item);
+                }
+            }
+        } catch (Throwable t) {
+            ErrorEventFactory.fromThrowable(t).handle();
+            synchronized (items) {
+                items.remove(item);
+            }
+        } finally {
+            transferring.setValue(false);
+        }
+    }
+
+    public void transferToDownloads(boolean open) throws Exception {
+        List<Item> toMove;
+        synchronized (items) {
+            toMove = items.stream()
+                    .filter(item -> item.getDownloadFinished().get())
+                    .toList();
+            if (toMove.isEmpty()) {
+                return;
+            }
+            items.removeAll(toMove);
+        }
+
+        var files = toMove.stream().map(item -> item.getLocalFile()).toList();
+        var downloads = getDownloadsTargetDirectory();
+        Files.createDirectories(downloads);
+        Path firstToOpen = null;
+        for (Path file : files) {
+            if (!Files.exists(file)) {
+                continue;
+            }
+
+            var target = downloads.resolve(file.getFileName());
+            // Prevent DirectoryNotEmptyException
+            if (Files.exists(target) && Files.isDirectory(target)) {
+                FileUtils.deleteDirectory(target.toFile());
+            }
+            if (Files.isDirectory(file)) {
+                FileUtils.moveDirectory(file.toFile(), target.toFile());
+            } else {
+                Files.move(file, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            if (firstToOpen == null) {
+                firstToOpen = target;
+            }
+        }
+        if (open && firstToOpen != null) {
+            DesktopHelper.browseFileInDirectory(firstToOpen);
+        }
+    }
+
+    private Path getDownloadsTargetDirectory() {
+        var def = AppSystemInfo.ofCurrent().getDownloads();
+        var custom = AppPrefs.get().downloadsDirectory().getValue();
+        if (custom == null) {
+            return def;
+        }
+
+        try {
+            var path = custom.asLocalPath();
+            if (Files.isDirectory(path)) {
+                return path;
+            }
+        } catch (InvalidPathException ignored) {
+        }
+        return def;
+    }
+
+    @Value
+    public static class Item {
+        BrowserFileSystemTabModel openFileSystemModel;
+        String name;
+        BrowserEntry browserEntry;
+        Path localFile;
+        Property<BrowserTransferProgress> progress;
+        ObservableBooleanValue downloadFinished;
+
+        public Item(
+                BrowserFileSystemTabModel openFileSystemModel, String name, BrowserEntry browserEntry, Path localFile) {
+            this.openFileSystemModel = openFileSystemModel;
+            this.name = name;
+            this.browserEntry = browserEntry;
+            this.localFile = localFile;
+            this.progress = new SimpleObjectProperty<>();
+            this.downloadFinished = Bindings.createBooleanBinding(
+                    () -> {
+                        return progress.getValue() != null
+                                && progress.getValue().done();
+                    },
+                    progress);
+        }
+    }
+}

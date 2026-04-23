@@ -1,0 +1,136 @@
+import java.util.stream.Collectors
+
+def distDir = "${project.layout.buildDirectory.get()}/dist"
+
+tasks.register('licenses', DefaultTask) {
+    doLast {
+        copy {
+            from "$projectDir/licenses/"
+            into "$distDir/licenses/"
+            include '*.license'
+            rename { String name ->
+                name.replace("license", "txt")
+            }
+        }
+    }
+}
+
+def debugArguments = file("$projectDir/debug/debug_arguments.txt").text.lines().map(s -> '"' + s + '"').collect(Collectors.joining(' '))
+
+if (os.isWindows()) {
+    tasks.register('baseDist', DefaultTask) {
+        doLast {
+            copy {
+                from "$distDir/jpackage/${jpackageExecutableName}"
+                into "$distDir/base"
+            }
+            copy {
+                from "$projectDir/logo/logo.ico"
+                into "$distDir/base"
+            }
+            copy {
+                from "$rootDir/lang"
+                into "$distDir/base/lang"
+            }
+
+            file("$distDir/base/app/.jpackage.xml").delete()
+
+            // Don't launch multiple exe instances: https://bugs.openjdk.org/browse/JDK-8340311
+            // We don't need the /app directory to be in the library path
+            def configFile = file("$distDir/base/app/${jpackageExecutableName}.cfg")
+            configFile.text = configFile.text.replace("[Application]", "[Application]\nwin.norestart=true")
+
+            def batLauncherFile = file("$distDir/base/runtime/bin/${jpackageExecutableName}.bat")
+            def batLauncherContent = batLauncherFile.text
+            batLauncherContent = batLauncherContent.replace(" -p \"%~dp0/../app\"", "")
+            batLauncherFile.text = batLauncherContent
+            file("$distDir/base/runtime/bin/${jpackageExecutableName}").delete()
+
+            file("$distDir/base/scripts").mkdirs()
+            def debug = file("$distDir/base/scripts/${jpackageExecutableName}_debug.bat")
+            debug.text = file("$projectDir/debug/windows/${jpackageExecutableName}_debug.bat").text.replace(
+                    'JVM-ARGS',
+                    debugArguments)
+            debug.setExecutable(true)
+
+            copy {
+                from "$distDir/licenses"
+                into "$distDir/base/licenses"
+            }
+        }
+    }
+} else if (os.isLinux()) {
+    tasks.register('baseDist', DefaultTask) {
+        doLast {
+            copy {
+                from "$distDir/jpackage/${jpackageExecutableName}"
+                into "$distDir/base/"
+            }
+            copy {
+                from "$projectDir/logo/logo.png"
+                into "$distDir/base/"
+            }
+            copy {
+                from "$projectDir/fonts"
+                into "$distDir/base/fonts"
+            }
+            copy {
+                from "$rootDir/lang"
+                into "$distDir/base/lang"
+            }
+
+            def shLauncherFile = file("$distDir/base/lib/runtime/bin/${jpackageExecutableName}")
+            def shLauncherContent = shLauncherFile.text
+            shLauncherContent = shLauncherContent.replace(" -p \"\$DIR/../app\"", "")
+            shLauncherFile.text = shLauncherContent
+            file("$distDir/base/lib/runtime/bin/${jpackageExecutableName}.bat").delete()
+
+            file("$distDir/base/scripts").mkdirs()
+            def debug = file("$distDir/base/scripts/${jpackageExecutableName}_debug.sh")
+            debug.text = file("$projectDir/debug/linux/${jpackageExecutableName}_debug.sh").text.replace(
+                    'JVM-ARGS',
+                    debugArguments)
+            debug.setExecutable(true, false)
+
+            copy {
+                from "$distDir/licenses"
+                into "$distDir/base/licenses"
+            }
+        }
+    }
+} else {
+    tasks.register('baseDist', DefaultTask) {
+        doLast {
+            def app = "${productName}.app"
+            copy {
+                from "$distDir/jpackage/${jpackageExecutableName}.app/Contents"
+                into "$distDir/$app/Contents/"
+            }
+            copy {
+                from "$distDir/licenses"
+                into "$distDir/$app/Contents/Resources/licenses"
+            }
+            copy {
+                from "$rootDir/lang"
+                into "$distDir/$app/Contents/Resources/lang"
+            }
+
+            def shLauncherFile = file("$distDir/$app/Contents/runtime/Contents/Home/bin/${jpackageExecutableName}")
+            def shLauncherContent = shLauncherFile.text
+            shLauncherContent = shLauncherContent.replace(" -p \"\$DIR/../app\"", "")
+            shLauncherFile.text = shLauncherContent
+            file("$distDir/$app/Contents/runtime/Contents/Home/bin/${jpackageExecutableName}.bat").delete()
+
+            file("$distDir/$app/Contents/Resources/scripts").mkdirs()
+            def debug = file("$distDir/$app/Contents/Resources/scripts/${jpackageExecutableName}_debug.sh")
+            debug.text = file("$projectDir/debug/mac/${jpackageExecutableName}_debug.sh").text.replace(
+                    'JVM-ARGS',
+                    debugArguments)
+            debug.setExecutable(true, false)
+        }
+    }
+}
+
+baseDist.dependsOn(licenses)
+baseDist.dependsOn(tasks.jpackage)
+dist.dependsOn(baseDist)
